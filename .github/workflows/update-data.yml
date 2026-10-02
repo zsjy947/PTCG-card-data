@@ -1,0 +1,42 @@
+name: 卡表数据同步
+
+# 每周全量同步 mik.moe 简中卡表；有变化时自动提交（有新数据则 commit 并补结构 tag）。
+# 完整性闸门（verify_data：卡数 + md5 与 manifest 一致）不通过则不提交。
+on:
+  schedule:
+    - cron: "0 21 * * 5"   # 每周五 UTC 21:00（北京时间周六 05:00）
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - name: 全量同步卡表
+        run: python fetch_data.py --force
+      - name: 数据完整性校验（不通过则不提交）
+        run: python tools/verify_data.py
+      - name: 有变化才提交（结构版本 tag 随首次提交补齐）
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add data/
+          if git diff --cached --quiet; then
+            echo "卡表无变化"
+            exit 0
+          fi
+          git commit -m "chore: card-table data weekly sync (fetch_data --force)"
+          TAG="v$(python -c "import json;print(json.load(open('data/manifest.json', encoding='utf-8'))['schemaVersion'])")"
+          if git rev-parse -q --verify "refs/tags/$TAG" >/dev/null; then
+            echo "tag $TAG 已存在（schemaVersion 未变），跳过"
+          else
+            git tag "$TAG"
+            echo "已打 tag $TAG（对应 manifest schemaVersion）"
+          fi
+          git push origin HEAD --tags
