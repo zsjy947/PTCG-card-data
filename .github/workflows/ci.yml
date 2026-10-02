@@ -1,0 +1,19 @@
+name: CI
+
+on:
+  push:
+    branches: ["*"]
+  pull_request:
+
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0  # verify_data 需要上次提交的索引做卡数骤减对比
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - name: 数据完整性校验（卡数 + md5 与 manifest 一致）
+        run: python tools/verify_data.py
