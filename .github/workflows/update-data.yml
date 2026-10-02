@@ -32,11 +32,13 @@ jobs:
             exit 0
           fi
           git commit -m "chore: card-table data weekly sync (fetch_data --force)"
+          git push origin HEAD
+          # 浅 clone 不含远端 tag：用 ls-remote 查远端是否已有对应结构版本 tag
           TAG="v$(python -c "import json;print(json.load(open('data/manifest.json', encoding='utf-8'))['schemaVersion'])")"
-          if git rev-parse -q --verify "refs/tags/$TAG" >/dev/null; then
+          if git ls-remote --exit-code --tags origin "refs/tags/$TAG" >/dev/null 2>&1; then
             echo "tag $TAG 已存在（schemaVersion 未变），跳过"
           else
             git tag "$TAG"
+            git push origin "$TAG"
             echo "已打 tag $TAG（对应 manifest schemaVersion）"
           fi
-          git push origin HEAD --tags
