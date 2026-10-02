@@ -1,0 +1,290 @@
+# -*- coding: utf-8 -*-
+"""从 Cryst's Cards Database（tcg.mik.moe）同步简中 PTCG 弹与卡牌数据到本地。
+
+数据源为简中社区维护的公开 API，本脚本只做只读拉取并缓存为 JSON，
+本仓库发布卡表源数据（不含卡牌效果文本与卡图），供各端热更新拉取。
+
+用法：
+    python fetch_data.py            # 增量同步（已有卡表的弹跳过）
+    python fetch_data.py --force    # 全量重新同步
+"""
+import argparse
+import hashlib
+import json
+import os
+import sys
+import time
+import urllib.request
+from pathlib import Path
+
+BASE = "https://tcg.mik.moe/api/v3"
+ROOT = Path(__file__).parent
+DATA = ROOT / "data"
+CARDS_DIR = DATA / "cards"
+
+HEADERS = {
+    "Content-Type": "application/json",
+    "Referer": "https://tcg.mik.moe/",
+    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) ptcc-gacha-sync",
+}
+SERIES_ZH = {
+    "Mega": "超级进化系列",
+    "Scarlet & Violet": "朱&紫 系列",
+    "Sword & Shield": "剑&盾 系列",
+    "Sun & Moon": "太阳&月亮 系列",
+    "30th": "30周年庆典",
+}
+
+
+def derive_series(code: str) -> str:
+    """mik 的 expansion 条目不带 series 字段，按弹代码前缀推导所属系列。"""
+    if code.startswith("MP"):
+        return "Mega"
+    if code.startswith("CSM"):
+        return "Sun & Moon"
+    if code.startswith(("CSV", "CBB")) or code == "151C":
+        return "Scarlet & Violet"
+    if code.startswith("CS"):
+        return "Sword & Shield"
+    return "PROMO" if code == "PROMO" else "Other"
+
+
+def post(path: str, payload: dict, retries: int = 3):
+    req = urllib.request.Request(
+        f"{BASE}/{path}",
+        data=json.dumps(payload).encode("utf-8"),
+        headers=HEADERS,
+        method="POST",
+    )
+    last = None
+    for i in range(retries):
+        try:
+            with urllib.request.urlopen(req, timeout=60) as r:
+                body = json.loads(r.read().decode("utf-8"))
+            if body.get("code") != 200:
+                raise RuntimeError(f"API 返回异常: {body.get('msg')}")
+            return body["data"]
+        except Exception as e:  # noqa: BLE001 - 网络重试
+            last = e
+            time.sleep(1.5 * (i + 1))
+    raise RuntimeError(f"请求 {path} 失败: {last}")
+
+
+def series_slug(series: str) -> str:
+    return {v: k for k, v in SERIES_ZH.items()}.get(series, series or "unknown")
+
+
+def set_file_id(code: str, series: str, seen: dict) -> str:
+    """同代码多系列（PROMO）时生成带系列后缀的唯一 ID。"""
+    if code not in seen:
+        seen[code] = series
+        return code
+    if seen[code] == series:
+        return code
+    return f"{code}__{series_slug(series)}"
+
+
+def fetch_all_expansions():
+    data = post("card/card-advance-search-params", {})
+    exp = data.get("expansion") or []
+    return exp
+
+
+def _atomic_write_json(path: Path, obj) -> None:
+    """原子写 JSON：进程中断不会留下截断文件。"""
+    tmp = path.with_suffix(path.suffix + ".tmp")
+    tmp.write_text(json.dumps(obj, ensure_ascii=False, indent=1), encoding="utf-8")
+    os.replace(tmp, path)
+
+
+def fetch_set_cards(code: str, series: str):
+    """按弹拉取完整卡表；分页不完整时抛错（调用方保留旧数据，不覆盖）。
+
+    2026-09 起 mik.moe 前端改版：card-advance-search 要求新版参数结构
+    （type/unique 等，从官方前端 bundle 提取对齐），旧请求体会被后端以
+    「内部错误」拒绝。series 只接受合法系列名（"PROMO" 等会被 Bad request），
+    而 set 已唯一确定弹，故恒传空数组不做系列过滤。
+    """
+    cards, page, item_num = [], 1, 0
+    while True:
+        payload = {
+            "type": "advance",
+            "name": "", "text": "", "m": [], "s": [], "label": [], "t": [],
+            "has": [], "weak": [], "rs": [], "series": [], "set": [code],
+            "artist": [], "r": [], "hp": None, "rc": None,
+            "reg": [], "mark": [], "unique": False, "page": page, "pageSize": 100,
+        }
+        d = post("card/card-advance-search", payload)
+        lst = d.get("list") or []
+        cards.extend(lst)
+        item_num = int(d.get("itemNum") or 0)
+        if not lst or len(cards) >= item_num or page > 50:
+            break
+        page += 1
+        time.sleep(0.2)
+    if item_num and len(cards) < item_num:
+        raise RuntimeError(f"分页不完整：取到 {len(cards)}/{item_num} 张")
+    return cards
+
+
+# ---- 收集啦151：按官方四弹（旅→望→惊→聚）拆分为四个可拆弹 ----
+# 同一卡表再版：185 张各弹共享，每弹另有 1-3 张独占插画卡。
+# 卡图编号相同，均沿用 151C 的图源；仅数据文件与条目拆分。
+SPLIT_151 = [
+    ("151C-LV", "收集啦151 旅", "旅"),
+    ("151C-WANG", "收集啦151 望", "望"),
+    ("151C-JING", "收集啦151 惊", "惊"),
+    ("151C-JU", "收集啦151 聚", "聚"),
+]
+
+
+def split_151() -> None:
+    """把 151C.json 按 waves_151.json 的官方四弹名单拆为四个卡表文件。"""
+    src_151 = CARDS_DIR / "151C.json"
+    wave_file = DATA / "waves_151.json"
+    if not (src_151.exists() and wave_file.exists()):
+        return
+    merged = json.loads(src_151.read_text(encoding="utf-8"))
+    waves = json.loads(wave_file.read_text(encoding="utf-8"))["waves"]
+    if not merged:  # 源卡表为空（如上游接口故障）时绝不执行拆分，防止空数据覆盖
+        return
+    for sid, sname, wkey in SPLIT_151:
+        nums = set(waves.get(wkey) or [])
+        subset = [c for c in merged if str(c["cardIndex"]).zfill(3) in nums]
+        _atomic_write_json(CARDS_DIR / f"{sid}.json", subset)
+        print(f"   [151拆分] {sname}（{sid}）{len(subset)} 张")
+
+
+def expand_sets(expansions: list, force: bool, only: str | None):
+    """逐弹同步卡表（增量/全量/指定弹），返回 (索引条目, 失败弹 id 列表)。"""
+    seen = {}
+    index = []
+    failed = []
+    for i, e in enumerate(expansions, 1):
+        code = e["setCode"]
+        if code == "151C" and (DATA / "waves_151.json").exists():
+            continue  # 已拆分为旅/望/惊/聚四弹
+        series = derive_series(code)
+        name = e.get("setName") or code
+        fid = set_file_id(code, series, seen)
+        out = CARDS_DIR / f"{fid}.json"
+        fetch_this = (not only) or only in (fid, code)
+
+        if (out.exists() and not force) or not fetch_this:
+            cards = json.loads(out.read_text(encoding="utf-8")) if out.exists() else []
+            print(f"[{i}/{len(expansions)}] {name}（{code}）本地已有 {len(cards)} 张，跳过")
+        else:
+            try:
+                cards = fetch_set_cards(code, series)
+            except Exception as exc:  # noqa: BLE001
+                print(f"[{i}/{len(expansions)}] {name}（{code}）拉取失败: {exc}")
+                failed.append(fid)
+                # 接口异常（上游故障/封禁/分页不完整）时保留已有卡表，绝不覆盖为空数据
+                cards = json.loads(out.read_text(encoding="utf-8")) if out.exists() else []
+            if not cards and out.exists():
+                # 成功返回但为空（上游分页异常等）：同样保留旧卡表，不覆盖（PTCG-R2-01）
+                try:
+                    cards = json.loads(out.read_text(encoding="utf-8"))
+                except ValueError:
+                    cards = []
+                if cards:
+                    print(f"[{i}/{len(expansions)}] {name}（{code}）上游返回空，保留原有 {len(cards)} 张")
+            _atomic_write_json(out, cards)
+            print(f"[{i}/{len(expansions)}] {name}（{code}）同步 {len(cards)} 张"
+                  + ("（保留原有数据）" if fid in failed and cards else ""))
+            time.sleep(0.25)
+
+        index.append({
+            "id": fid,
+            "code": code,
+            "name": name,
+            "series": series,
+            "seriesZh": SERIES_ZH.get(series, "特典卡" if series == "PROMO" else "其他"),
+            "count": len(cards),
+        })
+    return index, failed
+
+
+def insert_151_entries(index: list) -> list:
+    """拆分弹插入索引（替换 151C 的位置）。"""
+    if not (CARDS_DIR / "151C-LV.json").exists():
+        return index
+    pos = next((i for i, e in enumerate(index) if e["id"] == "151C"), len(index))
+    index = [e for e in index if e["id"] != "151C"]
+    entries_151 = []
+    for sid, sname, wkey in SPLIT_151:
+        f = CARDS_DIR / f"{sid}.json"
+        if f.exists():
+            n = len(json.loads(f.read_text(encoding="utf-8")))
+            entries_151.append({
+                "id": sid, "code": "151C", "name": sname,
+                "series": "Scarlet & Violet", "seriesZh": "朱&紫 系列",
+                "count": n,
+            })
+    index[pos:pos] = entries_151
+    return index
+
+
+def _md5(p: Path) -> str:
+    return hashlib.md5(p.read_bytes()).hexdigest()
+
+
+def write_manifest(index: list) -> None:
+    """数据清单：各端「数据热更新」按 md5 做增量比对，清单随仓库提交（raw 直链可拉）。
+
+    schemaVersion 是数据仓库独立演进的结构基线：沿用现有清单的值（缺省视为 1），
+    结构性变更（字段增删/语义变化）时人工递增并打对应 tag。
+    """
+    existing = {}
+    manifest_path = DATA / "manifest.json"
+    if manifest_path.exists():
+        try:
+            existing = json.loads(manifest_path.read_text(encoding="utf-8"))
+        except ValueError:
+            existing = {}
+    manifest = {
+        "schemaVersion": int(existing.get("schemaVersion") or 1),
+        "generated": time.strftime("%Y-%m-%dT%H:%M:%S+08:00"),
+        "sets": {
+            e["id"]: {"count": e["count"], "md5": _md5(CARDS_DIR / f"{e['id']}.json")}
+            for e in index if (CARDS_DIR / f"{e['id']}.json").exists()
+        },
+    }
+    _atomic_write_json(manifest_path, manifest)
+    print(f">> 数据清单已写入 data/manifest.json（schemaVersion={manifest['schemaVersion']}，{len(manifest['sets'])} 弹）")
+
+
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--force", action="store_true", help="忽略本地缓存全量重新拉取")
+    ap.add_argument("--only", metavar="SET_ID", help="仅同步指定弹（按弹 id 或代码），其余沿用本地数据")
+    args = ap.parse_args()
+
+    CARDS_DIR.mkdir(parents=True, exist_ok=True)
+    DATA.mkdir(exist_ok=True)
+
+    print(">> 拉取弹列表 ...")
+    expansions = fetch_all_expansions()
+    print(f"   共 {len(expansions)} 个弹")
+
+    if not args.only:
+        split_151()
+
+    index, failed = expand_sets(expansions, args.force, args.only)
+    index = insert_151_entries(index)
+
+    _atomic_write_json(DATA / "sets_index.json", index)
+    print(f">> 完成：{len(index)} 个弹，索引已写入 data/sets_index.json")
+
+    write_manifest(index)
+
+    if failed:
+        print(f">> 注意：{len(failed)} 弹拉取失败（已保留原有数据）：{'、'.join(failed[:10])}"
+              + ("…" if len(failed) > 10 else ""))
+        print(">> 上游接口可能故障或对本环境受限，建议稍后重试；本次不视为成功同步")
+        return 2  # 非零退出码：让 CI/定时任务显式失败，避免提交残缺数据
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
